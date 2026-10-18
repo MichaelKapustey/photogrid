@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildPdf, orientationMatrix } from '../src/pdf.js';
 import { parseJpeg } from '../src/jpeg.js';
-import { buildJpeg, embedFrom, iccProfile } from './fixtures.js';
+import { buildJpeg, embedFrom, iccProfile, imageFrom } from './fixtures.js';
 
 async function pdfText(blob) {
   return Buffer.from(await blob.arrayBuffer()).toString('latin1');
@@ -84,4 +84,22 @@ test('each EXIF orientation lands the stored corners where viewers show them', (
     assert.deepEqual(apply(matrix, 0, 1), corner(...storedTopLeft[orientation]), `top-left ${orientation}`);
     assert.deepEqual(apply(matrix, 1, 1), corner(...storedTopRight[orientation]), `top-right ${orientation}`);
   }
+});
+
+test('photos split into strips are drawn top to bottom with their overlap', async () => {
+  const upper = imageFrom(buildJpeg({ width: 40, height: 30 }), parseJpeg);
+  const lower = imageFrom(buildJpeg({ width: 40, height: 14 }), parseJpeg);
+  const embed = { width: 40, height: 40, pieces: [{ top: 0, height: 0.75, image: upper }, { top: 0.65, height: 0.35, image: lower }] };
+  const pdf = await pdfText(buildPdf([[{ id: 'strips', x: 10, y: 20, width: 100, height: 100 }]], new Map([['strips', embed]])));
+  const draws = [...pdf.matchAll(/q ([-\d. ]+) cm \/Im(\d+) Do Q/g)].map((match) => ({ matrix: match[1].split(' ').map(Number), ref: Number(match[2]) }));
+  assert.equal(draws.length, 2);
+  assert.notEqual(draws[0].ref, draws[1].ref);
+  const mm = 72 / 25.4;
+  const close = (a, b) => Math.abs(a - b) < 0.002;
+  const [first, second] = draws.map((draw) => draw.matrix);
+  assert.ok(close(first[3], 75 * mm) && close(second[3], 35 * mm));
+  assert.ok(close(first[5], (297 - 20 - 75) * mm));
+  assert.ok(close(second[5], (297 - 120) * mm));
+  assert.ok(second[5] + second[3] > first[5]);
+  assert.match(pdf, new RegExp(`/XObject << /Im${draws[0].ref} ${draws[0].ref} 0 R /Im${draws[1].ref} ${draws[1].ref} 0 R >>`));
 });

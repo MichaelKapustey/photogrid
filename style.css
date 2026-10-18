@@ -71,12 +71,12 @@
   --ring: var(--knife);
   --sans: 'Barlow', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   --narrow: 'Barlow Semi Condensed', 'Barlow', system-ui, sans-serif;
-  --sheet-width: min(40rem, max(18rem, calc((100vh - 200px) * 0.7071)));
+  --sheet-width: min(40rem, max(18rem, calc((100vh - 250px) * 0.7071)));
 }
 
 @supports (height: 100dvh) {
   :root {
-    --sheet-width: min(40rem, max(18rem, calc((100dvh - 200px) * 0.7071)));
+    --sheet-width: min(40rem, max(18rem, calc((100dvh - 250px) * 0.7071)));
   }
 }
 
@@ -281,7 +281,7 @@ main {
     height 0.22s ease;
 }
 
-.photo img {
+.photo canvas {
   display: block;
   width: 100%;
   height: 100%;
@@ -402,6 +402,82 @@ main {
   padding-block: 0.3em;
 }
 
+.boost {
+  gap: 14px;
+}
+
+.boost label {
+  flex: none;
+  font-size: 0.9375rem;
+  font-weight: 600;
+}
+
+#boost {
+  --thumb: 24px;
+  --track: 4px;
+  --fill: calc(var(--thumb) / 2 + (100% - var(--thumb)) * var(--ratio, 0));
+  flex: 1;
+  min-width: 0;
+  height: 44px;
+  margin: 0;
+  padding: 0;
+  background: none;
+  -webkit-appearance: none;
+  appearance: none;
+  cursor: pointer;
+  touch-action: pan-y;
+}
+
+#boost::-webkit-slider-runnable-track {
+  height: var(--track);
+  border-radius: var(--track);
+  background: linear-gradient(to right, var(--on-steel) var(--fill), var(--steel-edge) var(--fill));
+}
+
+#boost::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: var(--thumb);
+  height: var(--thumb);
+  margin-top: calc((var(--track) - var(--thumb)) / 2);
+  border: 3px solid var(--steel);
+  border-radius: 50%;
+  background: var(--on-steel);
+  box-shadow: 0 0 0 1.5px var(--on-steel);
+}
+
+#boost::-moz-range-track {
+  height: var(--track);
+  border-radius: var(--track);
+  background: var(--steel-edge);
+}
+
+#boost::-moz-range-progress {
+  height: var(--track);
+  border-radius: var(--track);
+  background: var(--on-steel);
+}
+
+#boost::-moz-range-thumb {
+  box-sizing: border-box;
+  width: var(--thumb);
+  height: var(--thumb);
+  border: 3px solid var(--steel);
+  border-radius: 50%;
+  background: var(--on-steel);
+  box-shadow: 0 0 0 1.5px var(--on-steel);
+}
+
+#boost-value {
+  flex: none;
+  min-width: 2.25rem;
+  text-align: right;
+  font-family: var(--narrow);
+  font-weight: 600;
+  font-size: 1.125rem;
+  font-variant-numeric: tabular-nums;
+}
+
 .size {
   display: flex;
   align-items: center;
@@ -463,7 +539,9 @@ main {
 }
 
 .primary:disabled {
-  opacity: 0.55;
+  background: var(--steel-edge);
+  color: var(--on-steel);
+  opacity: 0.75;
 }
 
 body.is-dragging .paper {
@@ -494,7 +572,7 @@ body.is-dragging .paper {
     transition: none;
   }
 
-  .photo img {
+  .photo canvas {
     animation: none;
   }
 }

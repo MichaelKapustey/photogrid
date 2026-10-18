@@ -1,8 +1,12 @@
+import { createAdjustment } from './adjust.js';
 import { BASE_LONG, BASE_SHORT, DEFAULT_STEP, PAGE, SIZE_STEPS, layoutPages } from './layout.js';
 import { buildPdf } from './pdf.js';
-import { isImageFile, preparePhoto, probePhoto } from './photos.js';
+import { isImageFile, preparePhoto, probePhoto, renderAdjusted } from './photos.js';
 
 const $ = (selector) => document.querySelector(selector);
+const BOOST_KEY = 'photogrid.boost';
+const SETTLE_MS = 600;
+const PAINT_BUDGET_MS = 12;
 
 const ui = {
   intro: $('#intro'),
@@ -14,6 +18,8 @@ const ui = {
   pages: $('#pages'),
   toolbar: $('#toolbar'),
   summary: $('#summary'),
+  boost: $('#boost'),
+  boostValue: $('#boost-value'),
   smaller: $('#smaller'),
   larger: $('#larger'),
   percent: $('#size-percent'),
@@ -24,13 +30,20 @@ const ui = {
   picker: $('#picker'),
 };
 
-const state = { photos: [], step: DEFAULT_STEP, notices: [], downloaded: false };
+const state = { photos: [], step: DEFAULT_STEP, boost: readBoost(), notices: [], failed: [], downloaded: false };
 const figures = new Map();
+const scratch = new Map();
+let adjustment = { boost: 0, apply: null };
 let nextId = 1;
-let queue = Promise.resolve();
+let working = false;
+let workTimer = 0;
+let paintFrame = 0;
+let boostChangedAt = -Infinity;
+let boostRun = new AbortController();
 let downloadUrl = null;
 let dragDepth = 0;
 
+ui.boost.value = String(state.boost);
 drawBlankSheet();
 render();
 
@@ -44,6 +57,8 @@ ui.picker.addEventListener('change', () => {
 ui.clear.addEventListener('click', clearAll);
 ui.smaller.addEventListener('click', () => resize(-1));
 ui.larger.addEventListener('click', () => resize(1));
+ui.boost.addEventListener('input', () => setBoost(Number(ui.boost.value)));
+ui.boost.addEventListener('change', () => saveBoost(state.boost));
 ui.download.addEventListener('click', download);
 ui.pages.addEventListener('click', (event) => {
   const button = event.target.closest('[data-remove]');
@@ -88,44 +103,113 @@ function addFiles(files) {
   const images = files.filter(isImageFile);
   const ignored = files.filter((file) => !isImageFile(file));
   if (ignored.length) state.notices.push(`${listNames(ignored.map((file) => file.name))} ${ignored.length === 1 ? "isn't a photo" : "aren't photos"}, so ${ignored.length === 1 ? 'it was' : 'they were'} left out.`);
-  const photos = images.map((file) => ({ id: nextId++, file, name: file.name, status: 'probing', width: 0, height: 0, embed: null, thumbnail: null }));
+  const photos = images.map((file) => ({ id: nextId++, file, name: file.name, status: 'probing', width: 0, height: 0, embed: null, source: null, thumbnail: null, shownBoost: null, adjusted: null }));
   state.photos.push(...photos);
   state.downloaded = false;
   render();
-  if (photos.length) queue = queue.then(() => processPhotos(photos));
+  work();
 }
 
-async function processPhotos(photos) {
-  for (const photo of photos) {
-    if (photo.removed) continue;
-    Object.assign(photo, await probePhoto(photo.file).catch(() => ({})));
-    photo.status = 'pending';
-    render();
-  }
-  const failed = [];
-  const reduced = [];
-  for (const photo of photos) {
-    if (photo.removed) continue;
-    try {
-      const prepared = await preparePhoto(photo.file, photo.embed);
-      if (photo.removed) {
-        URL.revokeObjectURL(prepared.thumbnail);
-        continue;
-      }
-      Object.assign(photo, prepared, { status: 'ready' });
-      if (prepared.reduced) reduced.push(photo.name);
-    } catch {
-      failed.push(photo.name);
-      dropPhoto(photo);
+function work() {
+  clearTimeout(workTimer);
+  if (working) return;
+  working = true;
+  runJobs().finally(() => {
+    working = false;
+  });
+}
+
+async function runJobs() {
+  for (;;) {
+    const job = nextJob();
+    if (!job) return;
+    if (job.delay) {
+      workTimer = setTimeout(work, job.delay);
+      return;
     }
+    await job.run();
+    reportFailures();
     render();
   }
-  if (failed.length) state.notices.push(`Couldn't open ${listNames(failed)}. PhotoGrid reads JPEG, PNG, HEIC and WebP photos.`);
-  if (reduced.length) {
-    const one = reduced.length === 1;
-    state.notices.push(`${listNames(reduced)} ${one ? 'was' : 'were'} too large for this browser, so ${one ? 'it was' : 'they were'} scaled down to fit.`);
+}
+
+function nextJob() {
+  const probing = state.photos.find((photo) => photo.status === 'probing');
+  if (probing) return { run: () => probe(probing) };
+  const pending = state.photos.find((photo) => photo.status === 'pending');
+  if (pending) return { run: () => prepare(pending) };
+  if (!state.boost) return null;
+  const stale = state.photos.find((photo) => photo.status === 'ready' && !photo.adjusted);
+  if (!stale) return null;
+  const wait = boostChangedAt + SETTLE_MS - performance.now();
+  if (wait > 0) return { delay: wait };
+  return { run: () => adjust(stale, state.boost, boostRun.signal) };
+}
+
+async function probe(photo) {
+  const result = await probePhoto(photo.file).catch(() => ({}));
+  if (photo.removed) return;
+  Object.assign(photo, result, { status: 'pending' });
+}
+
+async function prepare(photo) {
+  try {
+    const prepared = await preparePhoto(photo.file, photo.embed);
+    if (photo.removed) return;
+    Object.assign(photo, prepared, { status: 'ready', shownBoost: null });
+  } catch {
+    if (photo.removed) return;
+    state.failed.push(photo.name);
+    dropPhoto(photo);
   }
+}
+
+async function adjust(photo, boost, signal) {
+  let embed = null;
+  try {
+    embed = await renderAdjusted(photo.source, boost / 100, signal);
+  } catch {
+    if (signal.aborted) return;
+  }
+  if (photo.removed || boost !== state.boost) return;
+  if (!embed) state.notices.push(`Couldn't adjust the colors of ${photo.name}, so it will print as it is.`);
+  photo.adjusted = { embed: embed ?? photo.embed };
+}
+
+function reportFailures() {
+  if (!state.failed.length || state.photos.some((photo) => photo.status !== 'ready')) return;
+  state.notices.push(`Couldn't open ${listNames(state.failed)}. PhotoGrid reads JPEG, PNG, HEIC and WebP photos.`);
+  state.failed = [];
+}
+
+function setBoost(value) {
+  if (value === state.boost) return;
+  state.boost = value;
+  boostChangedAt = performance.now();
+  boostRun.abort();
+  boostRun = new AbortController();
+  state.downloaded = false;
+  for (const photo of state.photos) photo.adjusted = null;
   render();
+  schedulePaint();
+  work();
+}
+
+function readBoost() {
+  try {
+    const value = Number(localStorage.getItem(BOOST_KEY));
+    return Number.isInteger(value) && value >= 0 && value <= 100 && value % 5 === 0 ? value : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function saveBoost(value) {
+  try {
+    localStorage.setItem(BOOST_KEY, String(value));
+  } catch {
+    return;
+  }
 }
 
 function removePhoto(id) {
@@ -138,8 +222,9 @@ function removePhoto(id) {
 
 function dropPhoto(photo) {
   photo.removed = true;
+  photo.thumbnail = null;
+  photo.adjusted = null;
   state.photos = state.photos.filter((candidate) => candidate !== photo);
-  if (photo.thumbnail) URL.revokeObjectURL(photo.thumbnail);
   figures.get(photo.id)?.remove();
   figures.delete(photo.id);
 }
@@ -147,7 +232,9 @@ function dropPhoto(photo) {
 function clearAll() {
   [...state.photos].forEach(dropPhoto);
   state.notices = [];
+  state.failed = [];
   state.downloaded = false;
+  scratch.clear();
   ui.pages.replaceChildren();
   render();
   ui.choose.focus();
@@ -159,11 +246,15 @@ function resize(delta) {
   render();
 }
 
+function canDownload() {
+  return state.photos.length > 0 && state.photos.every((photo) => photo.status === 'ready' && (!state.boost || photo.adjusted));
+}
+
 function download() {
-  const ready = state.photos.filter((photo) => photo.status === 'ready');
-  if (ready.length === 0 || ready.length !== state.photos.length) return;
-  const pages = layoutPages(ready, SIZE_STEPS[state.step]);
-  const pdf = buildPdf(pages, new Map(ready.map((photo) => [photo.id, photo.embed])));
+  if (!canDownload()) return;
+  const pages = layoutPages(state.photos, SIZE_STEPS[state.step]);
+  const embeds = new Map(state.photos.map((photo) => [photo.id, state.boost ? photo.adjusted.embed : photo.embed]));
+  const pdf = buildPdf(pages, embeds);
   if (downloadUrl) URL.revokeObjectURL(downloadUrl);
   downloadUrl = URL.createObjectURL(pdf);
   const link = document.createElement('a');
@@ -212,11 +303,14 @@ function renderPages(pages) {
       shown.add(photo.id);
       position(figure, placement);
       if (figure.parentElement !== paper) paper.append(figure);
-      if (photo.thumbnail && !figure.querySelector('img')) {
-        const image = document.createElement('img');
-        image.alt = photo.name;
-        image.src = photo.thumbnail;
-        figure.prepend(image);
+      if (photo.thumbnail && !figure.querySelector('canvas')) {
+        const canvas = document.createElement('canvas');
+        canvas.width = photo.thumbnail.width;
+        canvas.height = photo.thumbnail.height;
+        canvas.setAttribute('role', 'img');
+        canvas.setAttribute('aria-label', photo.name);
+        figure.prepend(canvas);
+        paintPhoto(photo);
       }
       figure.classList.toggle('is-loading', !photo.thumbnail);
     }
@@ -229,14 +323,66 @@ function renderPages(pages) {
 function renderControls(pages, multiplier) {
   const total = state.photos.length;
   const ready = state.photos.filter((photo) => photo.status === 'ready').length;
+  const adjusted = state.boost ? state.photos.filter((photo) => photo.adjusted).length : total;
   ui.percent.textContent = `${Math.round(multiplier * 100)}%`;
   ui.dimensions.textContent = `${Math.round(BASE_SHORT * multiplier)} × ${Math.round(BASE_LONG * multiplier)} mm`;
   ui.smaller.disabled = state.step === 0;
   ui.larger.disabled = state.step === SIZE_STEPS.length - 1;
-  ui.download.disabled = total === 0 || ready < total;
+  const boostText = state.boost ? String(state.boost) : 'Off';
+  ui.boostValue.textContent = boostText;
+  ui.boost.setAttribute('aria-valuetext', boostText);
+  ui.boost.style.setProperty('--ratio', String(state.boost / 100));
+  ui.download.disabled = !canDownload();
   if (ready < total) ui.summary.textContent = `Preparing photos: ${ready} of ${total} ready`;
+  else if (adjusted < total) ui.summary.textContent = `Adjusting colors: ${adjusted} of ${total}`;
   else if (state.downloaded) ui.summary.textContent = 'PDF created. Print it at 100% scale to keep these sizes.';
   else ui.summary.textContent = `${count(total, 'photo')} on ${count(pages.length, 'page')}`;
+}
+
+function schedulePaint() {
+  if (!paintFrame) paintFrame = requestAnimationFrame(paint);
+}
+
+function paint() {
+  paintFrame = 0;
+  const deadline = performance.now() + PAINT_BUDGET_MS;
+  for (const photo of state.photos) {
+    if (!photo.thumbnail || photo.shownBoost === state.boost) continue;
+    paintPhoto(photo);
+    if (performance.now() > deadline) {
+      schedulePaint();
+      return;
+    }
+  }
+}
+
+function paintPhoto(photo) {
+  const canvas = figures.get(photo.id)?.querySelector('canvas');
+  if (!canvas || !photo.thumbnail) return;
+  const { thumbnail } = photo;
+  const apply = adjustmentFor(state.boost);
+  let pixels = thumbnail;
+  if (apply) {
+    pixels = scratchFor(thumbnail.width, thumbnail.height);
+    apply(thumbnail.data, pixels.data);
+  }
+  canvas.getContext('2d').putImageData(pixels, 0, 0);
+  photo.shownBoost = state.boost;
+}
+
+function adjustmentFor(boost) {
+  if (adjustment.boost !== boost) adjustment = { boost, apply: createAdjustment(boost / 100) };
+  return adjustment.apply;
+}
+
+function scratchFor(width, height) {
+  const key = `${width}x${height}`;
+  let pixels = scratch.get(key);
+  if (!pixels) {
+    pixels = new ImageData(width, height);
+    scratch.set(key, pixels);
+  }
+  return pixels;
 }
 
 function createSheet() {

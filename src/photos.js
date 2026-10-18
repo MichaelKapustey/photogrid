@@ -1,7 +1,12 @@
+import { createAdjustment } from './adjust.js';
 import { displaySize, isJpeg, parseJpeg } from './jpeg.js';
 
+export const MAX_CANVAS_AREA = 16777216;
+export const STRIP_OVERLAP = 16;
+const STRIP_ALIGN = 16;
+const CHUNK_AREA = 1048576;
 const THUMBNAIL_EDGE = 640;
-const SAFE_CANVAS_AREA = 16777216;
+const JPEG_QUALITY = 0.95;
 const HEIF_BRANDS = new Set(['heic', 'heix', 'hevc', 'hevx', 'heim', 'heis', 'mif1', 'msf1']);
 const IMAGE_NAME = /\.(jpe?g|png|webp|avif|gif|bmp|heic|heif)$/i;
 
@@ -9,20 +14,48 @@ export function isImageFile(file) {
   return file.type.startsWith('image/') || IMAGE_NAME.test(file.name);
 }
 
+export function planStrips(width, height, maxArea = MAX_CANVAS_AREA) {
+  if (width * height <= maxArea) return [{ top: 0, height }];
+  const rows = Math.floor((maxArea / width - STRIP_OVERLAP) / STRIP_ALIGN) * STRIP_ALIGN;
+  if (rows < STRIP_ALIGN) throw new Error('Image too wide');
+  const strips = [];
+  for (let start = 0; start < height; start += rows) {
+    const top = start === 0 ? 0 : start - STRIP_OVERLAP;
+    strips.push({ top, height: Math.min(start + rows, height) - top });
+  }
+  return strips;
+}
+
 export async function probePhoto(file) {
   const jpeg = await readJpeg(file);
-  if (jpeg) return { ...displaySize(jpeg), embed: embedFrom(file, jpeg) };
+  if (jpeg) return { ...displaySize(jpeg), embed: wholeImage(file, jpeg) };
   const size = await naturalSize(file);
   return { width: size?.width ?? 0, height: size?.height ?? 0, embed: null };
 }
 
 export async function preparePhoto(file, embed) {
-  const converted = embed ? null : await convertToJpeg(file);
-  const source = converted ? converted.embed : embed;
-  const image = converted ? converted.image : await decodeImage(file);
+  let source = file;
+  let original = embed;
+  let image = await decodeImage(file).catch(() => null);
+  if (!image) {
+    if (original || !(await looksLikeHeif(file))) throw new Error('Unsupported image');
+    const { heicToJpeg } = await import('./heic.js');
+    source = await heicToJpeg(file);
+    original = await jpegEmbed(source);
+    image = await decodeImage(source);
+  }
   try {
-    const thumbnail = await makeThumbnail(image);
-    return { ...displaySize(source), embed: source, thumbnail, reduced: converted?.reduced ?? false };
+    const result = original ?? (await renderImage(image, null));
+    return { width: result.width, height: result.height, embed: result, source, thumbnail: thumbnailPixels(image) };
+  } finally {
+    releaseImage(image);
+  }
+}
+
+export async function renderAdjusted(source, amount, signal) {
+  const image = await decodeImage(source);
+  try {
+    return await renderImage(image, createAdjustment(amount), signal);
   } finally {
     releaseImage(image);
   }
@@ -39,7 +72,11 @@ async function readJpeg(blob) {
   }
 }
 
-function embedFrom(blob, jpeg) {
+function wholeImage(blob, jpeg) {
+  return { ...displaySize(jpeg), pieces: [{ top: 0, height: 1, image: jpegImage(blob, jpeg) }] };
+}
+
+function jpegImage(blob, jpeg) {
   const { width, height, components, adobe, icc, orientation, length } = jpeg;
   return {
     width,
@@ -53,65 +90,82 @@ function embedFrom(blob, jpeg) {
   };
 }
 
-async function convertToJpeg(file) {
-  const image = await decodeImage(file).catch(() => null);
-  if (image) {
-    try {
-      const { blob, reduced } = await encodeJpeg(image);
-      return { image, embed: await embedJpeg(blob), reduced };
-    } catch (error) {
-      releaseImage(image);
-      throw error;
-    }
-  }
-  if (!(await looksLikeHeif(file))) throw new Error('Unsupported image');
-  const { heicToJpeg } = await import('./heic.js');
-  const blob = await heicToJpeg(file);
-  const embed = await embedJpeg(blob);
-  return { image: await decodeImage(blob), embed, reduced: false };
-}
-
-async function embedJpeg(blob) {
+async function jpegEmbed(blob) {
   const jpeg = await readJpeg(blob);
   if (!jpeg) throw new Error('Conversion failed');
-  return embedFrom(blob, jpeg);
+  return wholeImage(blob, jpeg);
 }
 
-async function encodeJpeg(image) {
+async function renderImage(image, adjust, signal) {
   const { naturalWidth: width, naturalHeight: height } = image;
-  for (const area of [width * height, SAFE_CANVAS_AREA]) {
-    const scale = Math.min(1, Math.sqrt(area / (width * height)));
-    const blob = await render(image, Math.round(width * scale), Math.round(height * scale), 0.95).catch(() => null);
-    if (blob) return { blob, reduced: scale < 1 };
+  const pieces = [];
+  for (const strip of planStrips(width, height)) {
+    const blob = await renderStrip(image, width, height, strip, adjust, signal);
+    const jpeg = await readJpeg(blob);
+    if (!jpeg) throw new Error('Encoding failed');
+    pieces.push({ top: strip.top / height, height: strip.height / height, image: jpegImage(blob, jpeg) });
   }
-  throw new Error('Image too large for this browser');
+  return { width, height, pieces };
 }
 
-async function makeThumbnail(image) {
-  const { naturalWidth: width, naturalHeight: height } = image;
-  const scale = Math.min(1, THUMBNAIL_EDGE / Math.max(width, height));
-  const blob = await render(image, Math.max(1, Math.round(width * scale)), Math.max(1, Math.round(height * scale)), 0.85);
-  return URL.createObjectURL(blob);
+async function renderStrip(image, width, height, strip, adjust, signal) {
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = strip.height;
+  try {
+    const context = canvas.getContext('2d', { willReadFrequently: Boolean(adjust) });
+    if (!context) throw new Error('Canvas unavailable');
+    context.fillStyle = '#fff';
+    context.fillRect(0, 0, width, strip.height);
+    context.drawImage(image, 0, -strip.top, width, height);
+    if (adjust) {
+      const rows = Math.max(1, Math.floor(CHUNK_AREA / width));
+      for (let top = 0; top < strip.height; top += rows) {
+        signal?.throwIfAborted();
+        const pixels = context.getImageData(0, top, width, Math.min(rows, strip.height - top));
+        adjust(pixels.data);
+        context.putImageData(pixels, 0, top);
+        await pause();
+      }
+    }
+    signal?.throwIfAborted();
+    return await encodeJpeg(canvas);
+  } finally {
+    canvas.width = 0;
+    canvas.height = 0;
+  }
 }
 
-async function render(image, width, height, quality) {
+function thumbnailPixels(image) {
+  const { naturalWidth, naturalHeight } = image;
+  const scale = Math.min(1, THUMBNAIL_EDGE / Math.max(naturalWidth, naturalHeight));
+  const width = Math.max(1, Math.round(naturalWidth * scale));
+  const height = Math.max(1, Math.round(naturalHeight * scale));
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
   try {
-    const context = canvas.getContext('2d');
+    const context = canvas.getContext('2d', { willReadFrequently: true });
     if (!context) throw new Error('Canvas unavailable');
     context.fillStyle = '#fff';
     context.fillRect(0, 0, width, height);
     context.imageSmoothingQuality = 'high';
     context.drawImage(image, 0, 0, width, height);
-    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', quality));
-    if (!blob) throw new Error('Canvas export failed');
-    return blob;
+    return context.getImageData(0, 0, width, height);
   } finally {
     canvas.width = 0;
     canvas.height = 0;
   }
+}
+
+function encodeJpeg(canvas) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error('Canvas export failed'))), 'image/jpeg', JPEG_QUALITY);
+  });
+}
+
+function pause() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 async function decodeImage(blob) {

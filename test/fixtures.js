@@ -85,8 +85,13 @@ export function buildJpeg({
   return new Uint8Array(bytes);
 }
 
-export function embedFrom(bytes, parse) {
+export function imageFrom(bytes, parse) {
   const info = parse(bytes);
   const blob = new Blob([bytes]);
   return { ...info, parts: info.ranges.map(([from, to]) => blob.slice(from, to)) };
+}
+
+export function embedFrom(bytes, parse) {
+  const image = imageFrom(bytes, parse);
+  return { width: image.width, height: image.height, pieces: [{ top: 0, height: 1, image }] };
 }

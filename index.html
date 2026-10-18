@@ -43,6 +43,11 @@
         <p id="summary" class="summary" aria-live="polite"></p>
         <button id="add" class="quiet" type="button">Add photos</button>
       </div>
+      <div class="toolbar-row boost">
+        <label for="boost">Color boost</label>
+        <input id="boost" type="range" min="0" max="100" step="5" value="0">
+        <output id="boost-value" for="boost">Off</output>
+      </div>
       <div class="toolbar-row">
         <div class="size" role="group" aria-label="Photo size">
           <button id="smaller" class="step" type="button" aria-label="Smaller photos">−</button>
