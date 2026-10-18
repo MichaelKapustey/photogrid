@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>PhotoGrid – print photos on A4</title>
+    <meta name="description" content="Pick photos, see them laid out on A4 pages and download a print-ready PDF. Your photos are never uploaded.">
+    <meta property="og:title" content="PhotoGrid">
+    <meta property="og:description" content="Pick photos, see them laid out on A4 pages and download a print-ready PDF. Your photos are never uploaded.">
+    <meta property="og:type" content="website">
+    <meta name="theme-color" content="#2b6a52" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#173b2e" media="(prefers-color-scheme: dark)">
+    <link rel="icon" href="icon.svg" type="image/svg+xml">
+    <link rel="preload" href="fonts/barlow-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="preload" href="fonts/barlow-latin-600-normal.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="stylesheet" href="style.css">
+    <script type="module" src="src/app.js"></script>
+  </head>
+  <body>
+    <header class="masthead">
+      <h1 class="wordmark">PhotoGrid</h1>
+      <button id="clear" class="quiet" type="button" hidden>Remove all</button>
+    </header>
+    <main>
+      <section id="intro" class="intro">
+        <div class="intro-sheet">
+          <div id="blank" class="paper blank"></div>
+          <button id="choose" class="primary choose" type="button">Choose photos</button>
+        </div>
+        <p class="lede">Lay your photos out on A4 and download a PDF to print.</p>
+        <p class="fine">Portrait photos go three to a row, so nine fill a page. Nothing is uploaded: everything happens on this device.</p>
+      </section>
+      <section id="workspace" class="workspace" aria-label="Print preview" hidden>
+        <div id="notice" class="notice" hidden>
+          <p id="notice-text"></p>
+          <button class="quiet" type="button" data-dismiss>Dismiss</button>
+        </div>
+        <div id="pages" class="pages"></div>
+      </section>
+    </main>
+    <footer id="toolbar" class="toolbar" hidden>
+      <div class="toolbar-row">
+        <p id="summary" class="summary" aria-live="polite"></p>
+        <button id="add" class="quiet" type="button">Add photos</button>
+      </div>
+      <div class="toolbar-row">
+        <div class="size" role="group" aria-label="Photo size">
+          <button id="smaller" class="step" type="button" aria-label="Smaller photos">−</button>
+          <p class="readout"><span id="size-percent">100%</span><span id="size-dimensions"></span></p>
+          <button id="larger" class="step" type="button" aria-label="Larger photos">+</button>
+        </div>
+        <button id="download" class="primary" type="button">Download PDF</button>
+      </div>
+    </footer>
+    <input id="picker" class="visually-hidden" type="file" accept="image/*" multiple tabindex="-1" aria-hidden="true">
+  </body>
+</html>
